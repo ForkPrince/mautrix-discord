@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"maunium.net/go/mautrix/event"
 	"github.com/starshine-sys/pkgo/v2"
 	"regexp"
 	"strings"
@@ -400,6 +401,25 @@ func (puppet *Puppet) UpdateInfo(source *User, info *discordgo.User, message *di
 	changed = puppet.UpdateAvatar(info) || changed
 	if changed {
 		puppet.Update()
+	}
+}
+
+func (puppet *Puppet) UpdatePresence(presence event.Presence, status string) {
+	puppet.syncLock.Lock()
+	defer puppet.syncLock.Unlock()
+
+	req := event.PresenceEventContent{
+		Presence:      presence,
+		StatusMessage: status,
+	}
+	u := puppet.DefaultIntent().BuildClientURL("v3", "presence", puppet.DefaultIntent().UserID, "status")
+	_, err := puppet.DefaultIntent().MakeRequest("PUT", u, req, nil)
+
+	if err != nil {
+		puppet.log.Warn().
+			Str("user_id", puppet.ID).
+			Err(err).
+			Msg("Failed to update presence")
 	}
 }
 
