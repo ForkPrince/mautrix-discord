@@ -70,6 +70,7 @@ func (br *DiscordBridge) RegisterCommands() {
 		cmdDeleteAllPortals,
 		cmdExec,
 		cmdCommands,
+		cmdSyncEmotes,
 		cmdSetPkUser,
 	)
 }
@@ -899,6 +900,57 @@ func fnDeleteAllPortals(ce *WrappedCommandEvent) {
 		}
 		ce.Reply("Finished background cleanup of deleted portal rooms.")
 	}()
+}
+
+var cmdSyncEmotes = &commands.FullHandler{
+	Func: wrapCommand(fnSyncEmotes),
+	Name: "sync-emotes",
+	Help: commands.HelpMeta{
+		Section:     HelpSectionPortalManagement,
+		Description: "Sync guild emojis from Discord",
+	},
+	RequiresLogin:      true,
+	RequiresEventLevel: roomModerator,
+	RequiresPortal:     true,
+}
+
+func fnSyncEmotes(ce *WrappedCommandEvent) {
+	portal := ce.Portal
+	if portal == nil {
+		ce.Reply("This command must be ran in a portal room")
+		return
+	}
+
+	if !portal.HasEmoticons {
+		portal.HasEmoticons = true
+		portal.Update()
+	} else {
+		portal.HasEmoticons = false
+		portal.Update()
+		ce.ReplyAdvanced("Room will no longer receive emoticon updates", true, true)
+		ce.Portal.updateRoomEmojis(make(map[string]matrixCustomEmoji))
+		return
+	}
+
+	var discordEmojis = portal.bridge.GetDiscordReactions(portal.GuildID, ce.User)
+
+	mxEmotes := make(map[string]matrixCustomEmoji)
+	for _, emoji := range discordEmojis {
+		mxEmotes[emoji.Name] = matrixCustomEmoji{
+			Uri:   portal.getEmojiMXCByDiscordID(emoji.ID, emoji.Name, emoji.Animated),
+			Usage: []string{"emoticon"},
+		}
+	}
+
+	var res = ""
+
+	for shortcode, emote := range mxEmotes {
+		res += fmt.Sprintf("- %s: %s - <img data-mx-emoticon height=\"24\" src=\"%s\" alt=\"\" title=\"%s\">\n", shortcode, emote.Uri.String(), emote.Uri.String(), shortcode)
+	}
+	res += "\nAny future emoticons should be automatically bridged"
+	ce.Portal.updateRoomEmojis(mxEmotes)
+
+	ce.ReplyAdvanced(res, true, true)
 }
 
 var cmdSetPkUser = &commands.FullHandler{

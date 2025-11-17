@@ -2452,6 +2452,31 @@ func (portal *Portal) updateRoomTopic() {
 	}
 }
 
+type matrixCustomEmoji struct {
+	Uri   id.ContentURI `json:"url"`
+	Usage []string      `json:"usage"`
+}
+
+var customEmojisState = event.Type{Type: "im.ponies.room_emotes", Class: event.StateEventType}
+
+func (portal *Portal) updateRoomEmojis(emojis map[string]matrixCustomEmoji) {
+	if portal.MXID != "" {
+		_, err := portal.MainIntent().SendStateEvent(portal.MXID, customEmojisState, "discord_guild_emojis", map[string]interface{}{
+			"images": emojis,
+			"pack": map[string]interface{}{
+				"usage":        []string{"emoticon"},
+				"display_name": portal.Guild.Name,
+				"attribution":  "Automatically created by the bridge from guild",
+			},
+		})
+		if err != nil {
+			portal.log.Err(err).Msg("Failed to update room emojis")
+		} else {
+			portal.TopicSet = true
+		}
+	}
+}
+
 func (portal *Portal) removeFromSpace() {
 	if portal.InSpace == "" {
 		return
@@ -2707,6 +2732,19 @@ func (br *DiscordBridge) HandleTombstone(evt *event.Event) {
 	portal.Update()
 	portal.log.Info().Msg("Followed tombstone and updated portal MXID")
 	portal.UpdateBridgeInfo()
+}
+
+
+func (br *DiscordBridge) GetDiscordReactions(guildId string, user *User) []*discordgo.Emoji {
+	if user == nil {
+		return nil
+	}
+
+	emojis, err := user.Session.GuildEmojis(guildId)
+	if err != nil {
+		return nil
+	}
+	return emojis
 }
 
 func (br *DiscordBridge) HandlePresence(evt *event.Event) {
