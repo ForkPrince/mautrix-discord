@@ -1635,9 +1635,9 @@ func (portal *Portal) convertReplyToQuote(eventID id.EventID, url string) (strin
 
 	puppet := portal.bridge.GetPuppetByMXID(evt.Sender)
 	if puppet != nil {
-		targetUser = fmt.Sprintf("@%s", puppet.Name)
+		targetUser = fmt.Sprintf("<@%s>", puppet.ID)
 	} else if user := portal.bridge.GetUserByMXID(evt.Sender); user != nil && user.DiscordID != "" {
-		targetUser = fmt.Sprintf("@%s", user.MXID)
+		targetUser = fmt.Sprintf("<@%s>", user.DiscordID)
 	} else if member := portal.bridge.StateStore.GetMember(portal.MXID, evt.Sender); member != nil && member.Displayname != "" {
 		targetUser = fmt.Sprintf("@%s", member.Displayname)
 	} else {
