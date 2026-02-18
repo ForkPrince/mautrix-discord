@@ -983,9 +983,11 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 
 	redactions := zerolog.Dict()
 	attachmentMap := map[string]*database.Message{}
+	existingAttachmentIDs := make(map[string]struct{})
 	for _, existingPart := range existing {
 		if existingPart.AttachmentID != "" {
 			attachmentMap[existingPart.AttachmentID] = existingPart
+			existingAttachmentIDs[existingPart.AttachmentID] = struct{}{}
 		}
 	}
 	for _, remainingAttachment := range msg.Attachments {
@@ -1018,6 +1020,103 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 			redactions.Str(deletedAttachment.AttachmentID, resp.EventID.String())
 		}
 		deletedAttachment.Delete()
+	}
+	
+	// Detect new attachments added in the edit
+	newAttachments := make([]*discordgo.MessageAttachment, 0)
+	for _, att := range msg.Attachments {
+		if _, existed := existingAttachmentIDs[att.ID]; !existed {
+			newAttachments = append(newAttachments, att)
+		}
+	}
+	
+	// Detect new stickers added in the edit
+	newStickers := make([]*discordgo.StickerItem, 0)
+	for _, sticker := range msg.StickerItems {
+		if _, existed := existingAttachmentIDs[sticker.ID]; !existed {
+			newStickers = append(newStickers, sticker)
+		}
+	}
+	
+	// Detect new video embeds added in the edit
+	newVideoEmbeds := make([]*discordgo.MessageEmbed, 0)
+	for _, embed := range msg.Embeds {
+		if getEmbedType(nil, embed) != EmbedVideo {
+			continue
+		}
+		embedID := "video_" + embed.URL
+		if _, existed := existingAttachmentIDs[embedID]; !existed {
+			newVideoEmbeds = append(newVideoEmbeds, embed)
+		}
+	}
+	
+	// Send new attachments as separate Matrix messages and track them
+	newMessageParts := make([]database.MessagePart, 0)
+	addedAttachments := zerolog.Dict()
+	ts, _ := discordgo.SnowflakeTimestamp(msg.ID)
+	
+	for _, att := range newAttachments {
+		log := log.With().Str("new_attachment_id", att.ID).Logger()
+		if part := portal.convertDiscordAttachment(log.WithContext(ctx), intent, msg.ID, att); part != nil {
+			resp, err := portal.sendMatrixMessage(intent, part.Type, part.Content, part.Extra, ts.UnixMilli())
+			if err != nil {
+				log.Err(err).Msg("Failed to send new attachment to Matrix")
+				continue
+			}
+			newMessageParts = append(newMessageParts, database.MessagePart{
+				AttachmentID: att.ID,
+				MXID:         resp.EventID,
+			})
+			addedAttachments.Str(att.ID, resp.EventID.String())
+		}
+	}
+	
+	for _, sticker := range newStickers {
+		log := log.With().Str("new_sticker_id", sticker.ID).Logger()
+		if part := portal.convertDiscordSticker(log.WithContext(ctx), intent, sticker); part != nil {
+			resp, err := portal.sendMatrixMessage(intent, part.Type, part.Content, part.Extra, ts.UnixMilli())
+			if err != nil {
+				log.Err(err).Msg("Failed to send new sticker to Matrix")
+				continue
+			}
+			newMessageParts = append(newMessageParts, database.MessagePart{
+				AttachmentID: sticker.ID,
+				MXID:         resp.EventID,
+			})
+			addedAttachments.Str(sticker.ID, resp.EventID.String())
+		}
+	}
+	
+	for i, embed := range newVideoEmbeds {
+		embedID := "video_" + embed.URL
+		log := log.With().
+			Str("new_video_embed_id", embedID).
+			Int("embed_index", i).
+			Logger()
+		if part := portal.convertDiscordVideoEmbed(log.WithContext(ctx), intent, embed); part != nil {
+			resp, err := portal.sendMatrixMessage(intent, part.Type, part.Content, part.Extra, ts.UnixMilli())
+			if err != nil {
+				log.Err(err).Msg("Failed to send new video embed to Matrix")
+				continue
+			}
+			newMessageParts = append(newMessageParts, database.MessagePart{
+				AttachmentID: embedID,
+				MXID:         resp.EventID,
+			})
+			addedAttachments.Str(embedID, resp.EventID.String())
+		}
+	}
+	
+	// Save new attachment mappings to database
+	if len(newMessageParts) > 0 {
+		newMsg := portal.bridge.DB.Message.New()
+		newMsg.Channel = portal.Key
+		newMsg.DiscordID = msg.ID
+		newMsg.SenderID = msg.Author.ID
+		newMsg.Timestamp = existing[0].Timestamp
+		newMsg.ThreadID = existing[0].ThreadID
+		newMsg.SenderMXID = intent.UserID
+		newMsg.MassInsertParts(newMessageParts)
 	}
 
 	var converted *ConvertedMessage
@@ -1073,6 +1172,7 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 	log.Debug().
 		Str("event_id", resp.EventID.String()).
 		Dict("redacted_attachments", redactions).
+		Dict("added_attachments", addedAttachments).
 		Msg("Finished handling Discord edit")
 }
 
