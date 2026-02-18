@@ -1050,73 +1050,78 @@ func (portal *Portal) handleDiscordMessageUpdate(user *User, msg *discordgo.Mess
 		}
 	}
 	
-	// Send new attachments as separate Matrix messages and track them
+	// When new attachments are added, we need to repost the entire message
+	// because Matrix can't edit a message to add attachments
 	newMessageParts := make([]database.MessagePart, 0)
 	addedAttachments := zerolog.Dict()
-	ts, _ := discordgo.SnowflakeTimestamp(msg.ID)
+	hasNewAttachments := len(newAttachments) > 0 || len(newStickers) > 0 || len(newVideoEmbeds) > 0
 	
-	for _, att := range newAttachments {
-		log := log.With().Str("new_attachment_id", att.ID).Logger()
-		if part := portal.convertDiscordAttachment(log.WithContext(ctx), intent, msg.ID, att); part != nil {
+	if hasNewAttachments {
+		ts, _ := discordgo.SnowflakeTimestamp(msg.ID)
+		
+		// Delete the old text message on Matrix if it exists
+		for _, existingPart := range existing {
+			if existingPart.AttachmentID == "" {
+				// This is the text part
+				resp, err := intent.RedactEvent(portal.MXID, existingPart.MXID)
+				if err != nil {
+					log.Err(err).
+						Str("event_id", existingPart.MXID.String()).
+						Msg("Failed to redact old text message for attachment repost")
+				} else {
+					redactions.Str("old_text_message", resp.EventID.String())
+				}
+				existingPart.Delete()
+				break
+			}
+		}
+		
+		// Repost the complete message with text + all attachments
+		parts := portal.convertDiscordMessage(ctx, puppet, intent, msg)
+		for i, part := range parts {
+			puppet.addWebhookMeta(part, msg)
+			puppet.addMemberMeta(part, msg)
+			if i == 0 {
+				part.Content.Mentions = portal.convertDiscordMentions(msg, false)
+			}
+			
 			resp, err := portal.sendMatrixMessage(intent, part.Type, part.Content, part.Extra, ts.UnixMilli())
 			if err != nil {
-				log.Err(err).Msg("Failed to send new attachment to Matrix")
+				log.Err(err).
+					Int("part_index", i).
+					Str("attachment_id", part.AttachmentID).
+					Msg("Failed to send reposted message part to Matrix")
 				continue
 			}
 			newMessageParts = append(newMessageParts, database.MessagePart{
-				AttachmentID: att.ID,
+				AttachmentID: part.AttachmentID,
 				MXID:         resp.EventID,
 			})
-			addedAttachments.Str(att.ID, resp.EventID.String())
+			addedAttachments.Str(part.AttachmentID, resp.EventID.String())
 		}
-	}
-	
-	for _, sticker := range newStickers {
-		log := log.With().Str("new_sticker_id", sticker.ID).Logger()
-		if part := portal.convertDiscordSticker(log.WithContext(ctx), intent, sticker); part != nil {
-			resp, err := portal.sendMatrixMessage(intent, part.Type, part.Content, part.Extra, ts.UnixMilli())
-			if err != nil {
-				log.Err(err).Msg("Failed to send new sticker to Matrix")
-				continue
+		
+		// Save new message mappings to database
+		if len(newMessageParts) > 0 {
+			newMsg := portal.bridge.DB.Message.New()
+			newMsg.Channel = portal.Key
+			newMsg.DiscordID = msg.ID
+			newMsg.SenderID = msg.Author.ID
+			newMsg.Timestamp = existing[0].Timestamp
+			newMsg.ThreadID = existing[0].ThreadID
+			newMsg.SenderMXID = intent.UserID
+			newMsg.MassInsertParts(newMessageParts)
+			
+			// Update edit timestamp on the new message
+			if msg.EditedTimestamp != nil {
+				newMsg.UpdateEditTimestamp(*msg.EditedTimestamp)
 			}
-			newMessageParts = append(newMessageParts, database.MessagePart{
-				AttachmentID: sticker.ID,
-				MXID:         resp.EventID,
-			})
-			addedAttachments.Str(sticker.ID, resp.EventID.String())
 		}
-	}
-	
-	for i, embed := range newVideoEmbeds {
-		embedID := "video_" + embed.URL
-		log := log.With().
-			Str("new_video_embed_id", embedID).
-			Int("embed_index", i).
-			Logger()
-		if part := portal.convertDiscordVideoEmbed(log.WithContext(ctx), intent, embed); part != nil {
-			resp, err := portal.sendMatrixMessage(intent, part.Type, part.Content, part.Extra, ts.UnixMilli())
-			if err != nil {
-				log.Err(err).Msg("Failed to send new video embed to Matrix")
-				continue
-			}
-			newMessageParts = append(newMessageParts, database.MessagePart{
-				AttachmentID: embedID,
-				MXID:         resp.EventID,
-			})
-			addedAttachments.Str(embedID, resp.EventID.String())
-		}
-	}
-	
-	// Save new attachment mappings to database
-	if len(newMessageParts) > 0 {
-		newMsg := portal.bridge.DB.Message.New()
-		newMsg.Channel = portal.Key
-		newMsg.DiscordID = msg.ID
-		newMsg.SenderID = msg.Author.ID
-		newMsg.Timestamp = existing[0].Timestamp
-		newMsg.ThreadID = existing[0].ThreadID
-		newMsg.SenderMXID = intent.UserID
-		newMsg.MassInsertParts(newMessageParts)
+		
+		log.Debug().
+			Dict("redacted_attachments", redactions).
+			Dict("reposted_parts", addedAttachments).
+			Msg("Finished handling Discord edit with new attachments - reposted complete message")
+		return
 	}
 
 	var converted *ConvertedMessage
